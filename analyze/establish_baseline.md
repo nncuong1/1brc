@@ -57,16 +57,31 @@ lsblk -d -o NAME,SIZE,ROTA,TYPE | grep -v loop
 
 **Command:**
 ```bash
-# Read the full 13 GB measurements file into /dev/null to measure raw throughput
-dd if=measurements.txt of=/dev/null bs=4M
+# Step 1: Force a true cold read by dropping the OS page cache
+# - 'sync' flushes any dirty write buffers to disk first (safe practice)
+# - 'echo 3' drops all page cache, dentries, and inodes from RAM
+#   so the next read is guaranteed to come off the SSD, not from RAM
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+
+# Step 2: Read the full 13 GB file with direct I/O to measure raw SSD throughput
+# - 'iflag=direct' uses O_DIRECT: data goes SSD → DMA buffer → /dev/null,
+#   completely bypassing the OS page cache on the read path
+#   This gives a clean, reproducible measurement of the actual hardware speed
+# - 'status=progress' shows live throughput during the read
+sudo dd if=measurements.txt of=/dev/null bs=4M iflag=direct status=progress
 ```
+
+> **Why not just `dd if=measurements.txt of=/dev/null bs=4M`?**
+> Without `drop_caches` + `iflag=direct`, the result depends on cache state:
+> - If the file is already cached in RAM → measures **RAM speed** (~10–20 GB/s), not SSD speed
+> - `iflag=direct` (O_DIRECT) forces every read to go through the storage controller, making results consistent and reproducible across runs
 
 **Result:**
 ```
-13,795,437,122 bytes (13 GB) copied, 4.97 s, 2.8 GB/s
+13795437122 bytes (14 GB, 13 GiB) copied, 2.88565 s, 4.8 GB/s
 ```
 
-**Conclusion:** The NVMe SSD can deliver **~2.8 GB/s** sequential read. At that rate, reading the full 13 GB file takes roughly **5 seconds** off a cold (not OS-cached) disk.
+**Conclusion:** The NVMe SSD can deliver **~4.8 GB/s** sequential read. At that rate, reading the full 13 GB file takes roughly **2.9 seconds** off a cold (not OS-cached) disk.
 
 ---
 
@@ -81,8 +96,8 @@ free -h
 ```
 
 **Implication:** Unlike the official server (pure RAM disk, always hot), on our laptop:
-- **First run** = cold SSD read (~5 s floor for I/O alone)
-- **Subsequent runs** = hot OS cache (~RAM speeds, well above 2.8 GB/s)
+- **First run** = cold SSD read (~2.9 s floor for I/O alone)
+- **Subsequent runs** = hot OS cache (~RAM speeds, well above 4.8 GB/s)
 
 When benchmarking locally, always do at least one warm-up run, then measure the warm run — this better simulates the official contest conditions (RAM disk).
 
@@ -122,17 +137,30 @@ public class FastestRead {
 > - `currentTimeMillis()` reads wall-clock time, which can jump backward or skip forward due to NTP sync or system clock adjustments — making elapsed-time measurements unreliable.
 > - `nanoTime()` uses a **monotonic clock** that only moves forward, guaranteed to give accurate elapsed time. It is the correct choice for any benchmark or duration measurement.
 
-**Command:**
+**Command** (run from project root — the file has a `package dev.morling.onebrc` declaration):
+
+To simulate the official contest's RAM disk (data always in RAM), **warm up the OS page cache first** before timing:
+
 ```bash
-javac FastestRead.java && java FastestRead
+# Warm-up pass 1 — loads file into OS page cache
+dd if=measurements.txt of=/dev/null bs=4M
+# Warm-up pass 2 — confirms the file is fully cached (should be near-instant compared to pass 1)
+dd if=measurements.txt of=/dev/null bs=4M
+
+# Now time the Java read — data is served from RAM, not SSD
+javac src/main/java/dev/morling/onebrc/FastestRead.java && \
+java -cp src/main/java dev.morling.onebrc.FastestRead
 ```
 
-**Result:**
+> Without the warm-up, Java reads from the SSD at ~3.1 GB/s (4403 ms) — the OS cache is populated on the fly.
+> With the warm-up, all 13 GB sit in the page cache and Java reads at **RAM speed**.
+
+**Result (with warm-up / hot cache):**
 ```
-FileChannel+DirectByteBuffer: 13156 MB in 4403 ms (3.1 GB/s)
+FileChannel+DirectByteBuffer: 13156 MB in 1058 ms (13.0 GB/s)
 ```
 
-**Conclusion:** Java FileChannel with a direct buffer can read the 13 GB file in **~4.4 seconds** at **3.1 GB/s**. This is the I/O lower bound — no solution can be faster than this for I/O-bound work on this machine.
+**Conclusion:** When the file is in the OS page cache (matching the official RAM disk), Java FileChannel can consume the full 13 GB in **~1 second** at **~13 GB/s**. This is the true I/O lower bound for our optimisation target.
 
 ---
 
@@ -158,12 +186,13 @@ sys     0m 4.749s
 
 ### Step 6 — Analyse the Gap
 
-| Measurement                        | Time      | Notes                              |
-|------------------------------------|-----------|------------------------------------|
-| Raw SSD read (dd)                  | ~5.0 s    | OS-level ceiling, cold read        |
-| Java FileChannel read (no parsing) | ~4.4 s    | Java I/O ceiling, warm (cached)    |
-| Official baseline (CalculateAverage_baseline) | ~124 s | Naive implementation |
-| **Gap to close**                   | **~120 s**| 28x slower than pure I/O           |
+| Measurement                                   | Time    | Notes                                        |
+|-----------------------------------------------|---------|----------------------------------------------|
+| Raw SSD read (dd + O_DIRECT)                  | ~2.9 s  | OS-level ceiling, cold read                  |
+| Java FileChannel read — cold/semi-warm        | ~4.4 s  | Page cache not fully populated               |
+| Java FileChannel read — hot cache (warm-up×2) | ~1.1 s  | File fully in RAM, matches official RAM disk |
+| Official baseline (CalculateAverage_baseline) | ~124 s  | Naive implementation                         |
+| **Gap to close**                              | **~123 s** | ~113x slower than pure I/O (hot cache)   |
 
 **Why is the baseline so slow?**
 1. `Files.lines()` creates a `String` object per line — 1 billion allocations = massive GC pressure
@@ -172,22 +201,23 @@ sys     0m 4.749s
 4. Single-threaded — does not use the 14 cores available
 
 **What the numbers tell us:**
-- Our I/O floor is ~4-5 seconds (either warm or cold). We cannot beat that without algorithmic changes (e.g. skipping reads with memory-mapped files + multiple threads)
-- Everything above 5 seconds is CPU/parsing overhead
-- With 14 cores and smarter parsing, a well-optimised solution should target **under 5 seconds** total
+- When data is cached (matching the official RAM disk), the Java I/O floor is **~1 second**. We cannot beat that without skipping byte reads entirely (e.g. `mmap`)
+- Everything above ~1 second is CPU/parsing overhead — roughly **123 seconds** of pure compute waste in the baseline
+- With 14 cores and smarter parsing, a well-optimised solution should target **2–4 seconds** total (I/O + compute in parallel)
 
 ---
 
 ### Summary
 
-| Question | Answer |
-|----------|--------|
-| SSD speed | ~2.8 GB/s sequential read |
-| File size | 13 GB (measurements.txt) |
-| I/O floor (dd) | ~5 seconds cold |
-| Java I/O floor (FileChannel) | ~4.4 seconds warm |
-| File cached in RAM after 1st run? | Yes — 30 GB RAM, 13 GB file fits |
-| Official baseline time | ~2 minutes 4 seconds |
-| Theoretical best (I/O bound) | ~4-5 seconds |
-| Cores available | 14 cores / 18 threads |
-| Key bottleneck in baseline | GC pressure + single-threaded String parsing |
+| Question                          | Answer                                          |
+|-----------------------------------|-------------------------------------------------|
+| SSD speed                         | ~4.8 GB/s sequential read                       |
+| File size                         | 13 GB (measurements.txt)                        |
+| I/O floor (dd + O_DIRECT)         | ~2.9 s cold                                     |
+| Java I/O floor — semi-warm        | ~4.4 s (page cache partially populated)         |
+| Java I/O floor — fully hot cache  | **~1.1 s at 13.0 GB/s** (matches RAM disk)     |
+| File cached in RAM after 1st run? | Yes — 30 GB RAM, 13 GB file fits                |
+| Official baseline time            | ~2 minutes 4 seconds                            |
+| Theoretical best (I/O bound)      | ~1.1 s hot cache / ~2.9 s cold SSD             |
+| Cores available                   | 14 cores / 18 threads                           |
+| Key bottleneck in baseline        | GC pressure + single-threaded String parsing    |
