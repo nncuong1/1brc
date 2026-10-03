@@ -4,7 +4,7 @@
 #          ./profile.sh EasySolution alloc
 #
 # Runs the class through jbang with async-profiler (via ap-loader) attached
-# and writes a flamegraph to profile-<JavaClassName>-<event>.html.
+# and writes a flamegraph to <timestamp>-profile-<JavaClassName>-<event>.html.
 
 set -e
 
@@ -18,7 +18,8 @@ fi
 CLASS_NAME="$1"
 EVENT="${2:-cpu}"
 SRC_FILE="src/main/java/dev/morling/onebrc/${CLASS_NAME}.java"
-OUT_FILE="profile-${CLASS_NAME}-${EVENT}.html"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+OUT_FILE="profile-${CLASS_NAME}-${EVENT}-${TIMESTAMP}.html"
 
 if [ ! -f "$SRC_FILE" ]; then
     echo "Error: File not found: $SRC_FILE"
